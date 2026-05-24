@@ -36,7 +36,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 TRONSCAN_API_KEY = os.getenv("TRONSCAN_API_KEY", os.getenv("TRONGRID_API_KEY", ""))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
-NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID", "")
 DB_PATH = os.getenv("DB_PATH", "wallets.db")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 PROXY_URL = os.getenv("PROXY_URL", "")
@@ -51,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 STATE_WAIT_ADDRESS = 1
 STATE_WAIT_LABEL = 2
+STATE_WAIT_NOTIFY_CHAT = 3
 
 db = Database(DB_PATH)
 tron_monitor = TronMonitor(
@@ -73,7 +73,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔗 <b>WalletMonitor - 链上钱包监控机器人</b>\n\n"
         "支持监控 TRX/TRC20 链上交易，发现新转账后实时推送通知。\n\n"
-        "请选择下方菜单操作。",
+        "请使用下方菜单操作。",
         parse_mode=ParseMode.HTML,
         reply_markup=MAIN_KEYBOARD,
     )
@@ -82,13 +82,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 <b>使用帮助</b>\n\n"
-        "📥 <b>添加监听</b> - 添加 TRON 钱包地址\n"
-        "📋 <b>监听列表</b> - 查看当前监听地址\n"
+        "📥 <b>添加监听</b> - 添加 TRON 钱包地址，并选择通知发送位置\n"
+        "📋 <b>监听列表</b> - 查看当前监听地址和通知目标\n"
         "🗑 <b>删除监听</b> - 删除已添加地址\n"
         "👤 <b>查用户ID</b> - 查看你的 Telegram 用户 ID\n"
         "📢 <b>查频道ID</b> - 选择频道并查看 ID\n"
         "👥 <b>查群组ID</b> - 选择群组并查看 ID\n\n"
-        "监控到新交易后会实时发送通知。",
+        "机器人必须在目标群组内，并拥有发消息权限，才能把交易通知发到群里。",
         parse_mode=ParseMode.HTML,
         reply_markup=MAIN_KEYBOARD,
     )
@@ -117,7 +117,10 @@ async def add_monitor_address(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.effective_chat.id
     for wallet in db.get_wallets(chat_id):
         if wallet["address"].upper() == address.upper():
-            await update.message.reply_text("⚠️ 该地址已经在监听列表中。", reply_markup=MAIN_KEYBOARD)
+            await update.message.reply_text(
+                "⚠️ 该地址已经在监听列表中。",
+                reply_markup=MAIN_KEYBOARD,
+            )
             return ConversationHandler.END
 
     context.user_data["pending_address"] = address
@@ -136,47 +139,136 @@ async def add_monitor_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     address = context.user_data.get("pending_address", "")
     if not address:
-        await update.message.reply_text("❌ 操作已过期，请重新添加。", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text(
+            "❌ 操作已过期，请重新添加。",
+            reply_markup=MAIN_KEYBOARD,
+        )
         return ConversationHandler.END
 
-    chat_id = update.effective_chat.id
-    success = db.add_wallet(address, label, chat_id)
-    if success:
-        db.update_last_tx_timestamp(address, int(time.time() * 1000), chat_id)
+    context.user_data["pending_label"] = label
+    keyboard = ReplyKeyboardMarkup(
+        [
+            ["📨 通知当前会话"],
+            [
+                KeyboardButton(
+                    "👥 选择通知群组",
+                    request_chat=KeyboardButtonRequestChat(
+                        request_id=3,
+                        chat_is_channel=False,
+                    ),
+                )
+            ],
+            ["❌ 取消"],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await update.message.reply_text(
+        "📨 <b>请选择交易通知发送位置</b>\n\n"
+        "可以发送到当前会话，也可以选择一个 Telegram 群组。\n"
+        "如果手动输入群 ID，请确保机器人已经加入该群并有发消息权限。",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+    return STATE_WAIT_NOTIFY_CHAT
+
+
+async def add_monitor_notify_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    address = context.user_data.get("pending_address", "")
+    label = context.user_data.get("pending_label", "")
+
+    if not address or not label:
         await update.message.reply_text(
-            f"✅ <b>监听添加成功</b>\n\n备注: <b>{label}</b>\n地址: <code>{address}</code>",
+            "❌ 操作已过期，请重新添加。",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+
+    owner_chat_id = update.effective_chat.id
+    target_desc = "当前会话"
+
+    if update.message.chat_shared:
+        notify_chat_id = update.message.chat_shared.chat_id
+        title = update.message.chat_shared.title or "已选择群组"
+        target_desc = f"{title} (<code>{notify_chat_id}</code>)"
+    else:
+        text = update.message.text.strip()
+        if text == "❌ 取消":
+            context.user_data.pop("pending_address", None)
+            context.user_data.pop("pending_label", None)
+            await update.message.reply_text(
+                "❌ 操作已取消。",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return ConversationHandler.END
+        if text == "📨 通知当前会话":
+            notify_chat_id = owner_chat_id
+        else:
+            try:
+                notify_chat_id = int(text)
+                target_desc = f"群组/会话 <code>{notify_chat_id}</code>"
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ 通知目标无效，请点击按钮选择，或输入正确的群 ID。",
+                    parse_mode=ParseMode.HTML,
+                )
+                return STATE_WAIT_NOTIFY_CHAT
+
+    success = db.add_wallet(address, label, owner_chat_id, notify_chat_id)
+    if success:
+        db.update_last_tx_timestamp(address, int(time.time() * 1000), owner_chat_id)
+        await update.message.reply_text(
+            f"✅ <b>监听添加成功</b>\n\n"
+            f"备注: <b>{label}</b>\n"
+            f"地址: <code>{address}</code>\n\n"
+            f"📨 通知发送到: {target_desc}",
             parse_mode=ParseMode.HTML,
             reply_markup=MAIN_KEYBOARD,
         )
     else:
-        await update.message.reply_text("❌ 添加失败，该地址可能已经存在。", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text(
+            "❌ 添加失败，该地址可能已经存在。",
+            reply_markup=MAIN_KEYBOARD,
+        )
 
     context.user_data.pop("pending_address", None)
+    context.user_data.pop("pending_label", None)
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("pending_address", None)
+    context.user_data.pop("pending_label", None)
     await update.message.reply_text("已取消。", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
 
 async def list_monitors(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    wallets = db.get_wallets(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    wallets = db.get_wallets(chat_id)
     if not wallets:
         await update.message.reply_text("📋 监听列表为空。", reply_markup=MAIN_KEYBOARD)
         return
 
     text = "📋 <b>监听列表</b>\n\n"
     for index, wallet in enumerate(wallets, 1):
-        text += f"<b>{index}.</b> {wallet['label']}\n<code>{wallet['address']}</code>\n\n"
+        notify_chat_id = wallet.get("notify_chat_id") or wallet["chat_id"]
+        notify_text = "当前会话" if notify_chat_id == chat_id else f"<code>{notify_chat_id}</code>"
+        text += (
+            f"<b>{index}.</b> {wallet['label']}\n"
+            f"<code>{wallet['address']}</code>\n"
+            f"📨 通知: {notify_text}\n\n"
+        )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_KEYBOARD)
 
 
 async def delete_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wallets = db.get_wallets(update.effective_chat.id)
     if not wallets:
-        await update.message.reply_text("📋 监听列表为空，没有可删除的地址。", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text(
+            "📋 监听列表为空，没有可删除的地址。",
+            reply_markup=MAIN_KEYBOARD,
+        )
         return
 
     keyboard = []
@@ -206,7 +298,7 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = query.message.chat_id
-    wallet = db.get_wallet_by_address(address, chat_id)
+    wallet = db.get_wallet(address, chat_id)
     success = db.remove_wallet(address, chat_id)
     if success:
         label = wallet["label"] if wallet else "未知"
@@ -386,11 +478,12 @@ async def monitor_task(application: Application):
             for wallet in wallets:
                 address = wallet["address"]
                 label = wallet["label"]
-                chat_id = wallet["chat_id"]
+                chat_id = wallet.get("notify_chat_id") or wallet["chat_id"]
+                owner_chat_id = wallet["chat_id"]
                 last_ts = wallet["last_tx_timestamp"]
 
                 if last_ts == 0:
-                    db.update_last_tx_timestamp(address, int(time.time() * 1000), chat_id)
+                    db.update_last_tx_timestamp(address, int(time.time() * 1000), owner_chat_id)
                     continue
 
                 min_ts = last_ts + 1
@@ -413,7 +506,7 @@ async def monitor_task(application: Application):
                     await send_tx_notification(application, chat_id, tx_info, label)
 
                 if new_max_ts > last_ts:
-                    db.update_last_tx_timestamp(address, new_max_ts, chat_id)
+                    db.update_last_tx_timestamp(address, new_max_ts, owner_chat_id)
                 await asyncio.sleep(1)
         except Exception as exc:
             logger.error("Monitor task error: %s", exc, exc_info=True)
@@ -425,26 +518,16 @@ async def send_tx_notification(application: Application, chat_id: int, tx_info: 
     message = tron_monitor.format_notification(tx_info, label)
     tx_url = f"https://tronscan.org/#/transaction/{tx_info['tx_id']}"
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 查看交易详情", url=tx_url)]])
-    targets = [chat_id]
-    if NOTIFY_CHAT_ID:
-        try:
-            extra_chat_id = int(NOTIFY_CHAT_ID)
-            if extra_chat_id not in targets:
-                targets.append(extra_chat_id)
-        except ValueError:
-            logger.warning("Invalid NOTIFY_CHAT_ID: %s", NOTIFY_CHAT_ID)
-
-    for target in targets:
-        try:
-            await application.bot.send_message(
-                chat_id=target,
-                text=message,
-                parse_mode=ParseMode.HTML,
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
-            )
-        except Exception as exc:
-            logger.error("Failed to send notification to %s: %s", target, exc)
+    try:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=message,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        logger.error("Failed to send notification to %s: %s", chat_id, exc)
 
 
 async def post_init(application: Application):
@@ -456,6 +539,7 @@ async def post_init(application: Application):
 def _make_fallback(handler_func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("pending_address", None)
+        context.user_data.pop("pending_label", None)
         await handler_func(update, context)
         return ConversationHandler.END
 
@@ -497,6 +581,10 @@ def main():
         states={
             STATE_WAIT_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_monitor_address)],
             STATE_WAIT_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_monitor_label)],
+            STATE_WAIT_NOTIFY_CHAT: [
+                MessageHandler(filters.StatusUpdate.CHAT_SHARED, add_monitor_notify_chat),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_monitor_notify_chat),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel), *menu_fallback_handlers],
     )
@@ -515,6 +603,7 @@ def main():
     application.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del:"))
     application.add_handler(MessageHandler(filters.StatusUpdate.CHAT_SHARED, handle_chat_shared))
     application.add_handler(MessageHandler(filters.Regex(r"^取消$"), handle_cancel_keyboard))
+    application.add_handler(MessageHandler(filters.Regex(r"^❌ 取消$"), handle_cancel_keyboard))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_usdt_calc))
 
     async def _handle_network_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
