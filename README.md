@@ -113,7 +113,8 @@ LOG_LEVEL=INFO
 SPACESHIP_API_KEY=your_spaceship_api_key_here
 SPACESHIP_API_SECRET=your_spaceship_api_secret_here
 SPACESHIP_API_BASE=https://spaceship.dev/api/v1
-DOMAIN_CHECK_INTERVAL=300
+DOMAIN_CHECK_INTERVAL_MIN=60
+DOMAIN_CHECK_IDLE_INTERVAL=300
 DOMAIN_CHECK_START=01:40
 DOMAIN_CHECK_END=03:30
 DOMAIN_NOTIFY_COUNT=5
@@ -139,7 +140,8 @@ python bot.py
 | `SPACESHIP_API_KEY` | ❌ | - | Spaceship API Key，用于域名可注册检测 |
 | `SPACESHIP_API_SECRET` | ❌ | - | Spaceship API Secret，用于域名可注册检测 |
 | `SPACESHIP_API_BASE` | ❌ | `https://spaceship.dev/api/v1` | Spaceship API 基础地址 |
-| `DOMAIN_CHECK_INTERVAL` | ❌ | `300` | 域名后台检测间隔（秒） |
+| `DOMAIN_CHECK_INTERVAL_MIN` | ❌ | `60` | 单域名最小检测间隔（秒，Spaceship 限制） |
+| `DOMAIN_CHECK_IDLE_INTERVAL` | ❌ | `300` | 无待检测域名时的休眠间隔（秒）；有域名时按数量自动计算 |
 | `DOMAIN_CHECK_START` | ❌ | `01:40` | 每日域名检测开始时间 |
 | `DOMAIN_CHECK_END` | ❌ | `03:30` | 每日域名检测结束时间 |
 | `DOMAIN_NOTIFY_COUNT` | ❌ | `5` | 域名可注册提醒次数 |
