@@ -75,6 +75,27 @@ class Database:
                         UNIQUE (user_id, address)
                     )
                 """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS domain_watches (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        domain TEXT NOT NULL,
+                        user_id INTEGER,
+                        chat_id INTEGER NOT NULL,
+                        notify_chat_id INTEGER,
+                        is_active INTEGER DEFAULT 1,
+                        notification_count INTEGER DEFAULT 0,
+                        last_available TEXT,
+                        last_checked_at TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE (domain, chat_id)
+                    )
+                """)
+                self._ensure_column(conn, "domain_watches", "notify_chat_id", "INTEGER")
+                self._ensure_column(conn, "domain_watches", "user_id", "INTEGER")
+                self._ensure_column(conn, "domain_watches", "is_active", "INTEGER DEFAULT 1")
+                self._ensure_column(conn, "domain_watches", "notification_count", "INTEGER DEFAULT 0")
+                self._ensure_column(conn, "domain_watches", "last_available", "TEXT")
+                self._ensure_column(conn, "domain_watches", "last_checked_at", "TIMESTAMP")
                 conn.commit()
             finally:
                 conn.close()
@@ -470,6 +491,115 @@ class Database:
                         (user_id,),
                     ).fetchall()
                 return [dict(row) for row in rows]
+            finally:
+                conn.close()
+
+    def upsert_domain_watch(
+        self,
+        domain: str,
+        chat_id: int,
+        notify_chat_id: int | None = None,
+    ) -> bool:
+        user = self.ensure_user_for_chat(chat_id, notify_chat_id=notify_chat_id)
+        if notify_chat_id is None:
+            notify_chat_id = user.get("notify_chat_id") or chat_id
+
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO domain_watches
+                        (domain, user_id, chat_id, notify_chat_id, is_active)
+                    VALUES (?, ?, ?, ?, 1)
+                    ON CONFLICT(domain, chat_id) DO UPDATE SET
+                        user_id = excluded.user_id,
+                        notify_chat_id = excluded.notify_chat_id,
+                        is_active = 1,
+                        notification_count = 0
+                    """,
+                    (domain, user["id"], chat_id, notify_chat_id),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+            finally:
+                conn.close()
+
+    def get_active_domain_watches(self) -> list[dict]:
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        domain_watches.id,
+                        domain_watches.domain,
+                        domain_watches.user_id,
+                        domain_watches.chat_id,
+                        COALESCE(domain_watches.notify_chat_id, domain_watches.chat_id) AS notify_chat_id,
+                        COALESCE(domain_watches.notification_count, 0) AS notification_count,
+                        domain_watches.last_available,
+                        domain_watches.last_checked_at
+                    FROM domain_watches
+                    LEFT JOIN users ON users.id = domain_watches.user_id
+                    WHERE domain_watches.is_active = 1
+                      AND COALESCE(users.is_active, 1) = 1
+                    ORDER BY domain_watches.id ASC
+                    """
+                ).fetchall()
+                return [dict(row) for row in rows]
+            finally:
+                conn.close()
+
+    def update_domain_watch_check(self, watch_id: int, available: str):
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute(
+                    """
+                    UPDATE domain_watches
+                    SET last_available = ?, last_checked_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (available, watch_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def deactivate_domain_watch(self, watch_id: int, available: str = "Yes"):
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute(
+                    """
+                    UPDATE domain_watches
+                    SET is_active = 0,
+                        last_available = ?,
+                        last_checked_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (available, watch_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def set_domain_watch_notification_count(self, watch_id: int, count: int):
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute(
+                    """
+                    UPDATE domain_watches
+                    SET notification_count = ?,
+                        last_available = 'Yes',
+                        last_checked_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (count, watch_id),
+                )
+                conn.commit()
             finally:
                 conn.close()
 
